@@ -1,27 +1,11 @@
 import Foundation
+import os.log
 import Swifter
 
 public final class HlsServer: HttpServer {
-	var targetSegmentLength: Int = 3
-	let segmentLength: TimeInterval = 2.9866666
-	let seekingWindowInSeconds: TimeInterval = 18_000 // 5h
-	let skippableSegments = 6
-	var isStale: Bool = false {
-		didSet {
-			guard isStale != oldValue else { return }
-
-			if isStale {
-				stopScheduledPlaylistUpdates()
-			} else {
-				startScheduledPlaylistUpdates()
-			}
-		}
-	}
-	let path: String
-	let segmentsPath: String = "segments"
-	let livestreamPlaylistFilename = "main-ios.m3u8"
-	let livestreamVariantFilename = "main-128000-ios.m3u8"
-	var livestreamUrl: URL? {
+	public var isStale: Bool = false
+	public let livestreamPlaylistFilename: String
+	public var livestreamUrl: URL? {
 		guard
 			let port = try? self.port()
 		else {
@@ -29,6 +13,12 @@ public final class HlsServer: HttpServer {
 		}
 		return URL(string: "http://localhost:\(port)/\(path)/\(livestreamPlaylistFilename)")
 	}
+	public var now: Date {
+		Date().addingTimeInterval(-serverToNowDifference)
+	}
+	public let path: String
+	public let seekingWindowInSeconds: TimeInterval
+	public let segmentLength: TimeInterval
 
 	/// The difference in seconds between the server time and the client time.
 	///
@@ -61,30 +51,104 @@ public final class HlsServer: HttpServer {
 	/// )
 	/// ```
 	/// This way the time passes in realtime relative to a fixed start date.
-	let serverToNowDifference: TimeInterval
-	var now: Date {
-		Date().addingTimeInterval(-serverToNowDifference)
+	public let serverToNowDifference: TimeInterval
+
+	public let skippableSegments: Int
+	public let targetSegmentLength: Int
+
+	/// Creates an `HlsServer` instance.
+	/// - Parameters:
+	///   - livestreamPlaylistFilename: The name of the playlist. Defaults to `main-ios.m3u8`.
+	///   - path: The path to register for hls. Defaults to `mockServer`.
+	///   - seekingWindowInSeconds: The seeking in window in seconds. Defaults to five hours.
+	///   - segmentLength: The actual segment length in seconds. Defaults to `2.9866666`.
+	///   - skippableSegments: This value + 1 determines the number of segments returned for delta updates. Defaults to `6`.
+	///   - targetSegmentLength: The target duration of a segment (`#EXT-X-TARGETDURATION`). Defaults to `3`.
+	///   - serverToNowDifference: The time difference between the client and the server. Defaults to `0`. See ``serverToNowDifference``.
+	public init(livestreamPlaylistFilename: String = "main-ios.m3u8",
+							path: String = "mockServer",
+							seekingWindowInSeconds: TimeInterval = 18_000,
+							segmentLength: TimeInterval = 2.9866666,
+							skippableSegments: Int = 6,
+							targetSegmentLength: Int = 3,
+							serverToNowDifference: TimeInterval = 0) {
+		self.livestreamPlaylistFilename = livestreamPlaylistFilename
+		self.path = path
+		self.seekingWindowInSeconds = seekingWindowInSeconds
+		self.segmentLength = segmentLength
+		self.skippableSegments = skippableSegments
+		self.targetSegmentLength = targetSegmentLength
+		self.serverToNowDifference = serverToNowDifference
+
+		super.init()
+
+		startScheduledPlaylistUpdates()
+
+		// segments
+		self["/\(path)/\(segmentsPath)/:segmentName"] = { request in
+			os_log("request path is %{public}@", log: log, type: .info, request.path)
+
+			let filePath = Bundle.module.resourcePath! + "/segments/sample\(self.segmentFileIndex).ts"
+
+			os_log("streaming file from %{public}@", log: log, type: .info, filePath)
+
+			if let file = try? filePath.openForReading() {
+				var responseHeader: [String: String] = ["Content-Type": "video/mp2t"]
+
+				if let attr = try? FileManager.default.attributesOfItem(atPath: filePath),
+					 let fileSize = attr[FileAttributeKey.size] as? UInt64 {
+					responseHeader["Content-Length"] = String(fileSize)
+				}
+
+				return .raw(200, "OK", responseHeader, { writer in
+					try? writer.write(file)
+					file.close()
+				})
+			}
+			return .notFound
+		}
+
+		self["/\(path)/\(livestreamPlaylistFilename)"] = { request in
+			os_log("request main playlist", log: log, type: .info)
+
+			return .ok(
+				.data("""
+					#EXTM3U
+					#EXT-X-VERSION:9
+					#EXT-X-ALLOW-CACHE:NO
+					## Created with Z/IPStream R/2 v1.08.09
+					#EXT-X-STREAM-INF:BANDWIDTH=137557,CODECS="mp4a.40.2"
+					\(self.livestreamVariantFilename)
+					""".data(using: .utf8)!,
+							contentType: "application/vnd.apple.mpegurl"
+				)
+			)
+		}
+
+		self["/\(path)/\(livestreamVariantFilename)"] = { [weak self] request in
+			guard let self = self else { return .internalServerError }
+
+			if request.queryParams.contains(where: { (key, value) in key == "_HLS_skip" && value == "YES" }) {
+				os_log("requesting delta variant playlist", log: log, type: .info)
+				return .ok(.data(self.currentDeltaPlaylist.data(using: .utf8)!, contentType: "application/vnd.apple.mpegurl"))
+			} else {
+				os_log("requesting variant playlist", log: log, type: .info)
+				return .ok(.data(self.currentPlaylist.data(using: .utf8)!, contentType: "application/vnd.apple.mpegurl"))
+			}
+		}
 	}
 
-	private var segmentCount: Int { Int(seekingWindowInSeconds / Double(targetSegmentLength)) }
-	private let initialMediaSequence = 1_000_000
-	private var numberOfPlaylistUpdates = 0
-	private var currentPlaylist: String = ""
+	deinit {
+		timer.setEventHandler {}
+		timer.cancel()
+
+		// If the timer is suspended, calling cancel without resuming triggers a crash.
+		// This is documented here https://forums.developer.apple.com/thread/15902
+		startScheduledPlaylistUpdates()
+	}
+
 	private var currentDeltaPlaylist: String = ""
-
-	private var previousDeltaPlaylistResponse: String?
-	private var previousPlaylistResponse: String?
-	private var previousDate: Date?
-
-	private lazy var timer: DispatchSourceTimer = {
-		let t = DispatchSource.makeTimerSource()
-		t.schedule(deadline: .now(), repeating: TimeInterval(self.targetSegmentLength))
-		t.setEventHandler(handler: { [weak self] in
-			self?.updatePlaylist()
-		})
-		return t
-	}()
-	private var isTimerSuspended = true
+	private var currentPlaylist: String = ""
 
 	private lazy var dateFormatter: DateFormatter = {
 		let formatter = DateFormatter()
@@ -94,29 +158,48 @@ public final class HlsServer: HttpServer {
 		return formatter
 	}()
 
+	private let initialMediaSequence = 1_000_000
+	private var isTimerSuspended = true
+
+	private let livestreamVariantFilename = "main-128000-ios.m3u8"
+	private var numberOfPlaylistUpdates = 0
+	private var previousSegmentIndex = 0
+	private var segmentCount: Int { Int(seekingWindowInSeconds / Double(targetSegmentLength)) }
+
+	private var segmentFileIndex: Int {
+		defer { previousSegmentIndex = (previousSegmentIndex + 1) % segmentIndices.count }
+		return segmentIndices[previousSegmentIndex]
+	}
+	private var segmentIndices = Array(0...9)
+	private let segmentsPath = "segments"
+
+	private lazy var timer: DispatchSourceTimer = {
+		let t = DispatchSource.makeTimerSource()
+		t.schedule(deadline: .now(), repeating: TimeInterval(self.targetSegmentLength))
+		t.setEventHandler(handler: { [weak self] in
+			self?.updatePlaylist()
+		})
+		return t
+	}()
+
 	@objc private func updatePlaylist() {
+		guard !isStale else { return }
 
-//		if currentMediaSequence >= 1_000_010 {
-//			print("playlist is stale now")
-//			return
-//		}
-
-		// simulate one segment length latency to the live time
-		let mostRecentSegmentPDT = now.addingTimeInterval(-segmentLength)
+		let mostRecentSegmentPDT = now
 
 		// this is constant since segments are removed from the top and added to the bottom (5993 in our case)
 		let skippedSegments = segmentCount-skippableSegments-1
 
 		var fullPlaylist = """
 			#EXTM3U
-			#EXT-X-VERSION:3
+			#EXT-X-VERSION:9
 			#EXT-X-MEDIA-SEQUENCE:\(initialMediaSequence + numberOfPlaylistUpdates)
 			#EXT-X-TARGETDURATION:\(targetSegmentLength)
 			#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=\(skippableSegments * targetSegmentLength)
 			"""
 
 		var deltaPlayist = fullPlaylist
-		deltaPlayist += "\n#EXT-X-SKIP:SKIPPED-SEGMENTS=\(skippedSegments)\n" // this is the total number of skipped segments
+		deltaPlayist += "\n#EXT-X-SKIP:SKIPPED-SEGMENTS=\(skippedSegments)" // this is the total number of skipped segments
 
 		for segmentIndex in numberOfPlaylistUpdates ..< segmentCount + numberOfPlaylistUpdates {
 			let inverseIndex = segmentCount + numberOfPlaylistUpdates - segmentIndex - 1
@@ -145,19 +228,10 @@ public final class HlsServer: HttpServer {
 		numberOfPlaylistUpdates += 1
 	}
 
-	deinit {
-		timer.setEventHandler {}
-		timer.cancel()
-
-		// If the timer is suspended, calling cancel without resuming triggers a crash.
-		// This is documented here https://forums.developer.apple.com/thread/15902
-		startScheduledPlaylistUpdates()
-	}
-
 	private func startScheduledPlaylistUpdates() {
 		guard isTimerSuspended else { return }
 
-		print("playlist timer update started")
+		os_log("playlist timer update started", log: log, type: .info)
 
 		timer.resume()
 		isTimerSuspended.toggle()
@@ -166,73 +240,9 @@ public final class HlsServer: HttpServer {
 	private func stopScheduledPlaylistUpdates() {
 		guard !isTimerSuspended else { return }
 
-		print("playlist timer update stopped")
+		os_log("playlist timer update stopped", log: log, type: .info)
 		timer.suspend()
 	}
-
-	public init(path: String = "mockServer",
-							serverToNowDifference: TimeInterval = 0) {
-		self.path = path
-		self.serverToNowDifference = serverToNowDifference
-
-		super.init()
-
-		startScheduledPlaylistUpdates()
-
-		// segments
-		self["/\(path)/\(segmentsPath)/:segmentName"] = { request in
-			print("request path is \(request.path)")
-
-			let filePath = Bundle.module.resourcePath! + "/segments/sample.ts"
-
-			if let file = try? filePath.openForReading() {
-				var responseHeader: [String: String] = ["Content-Type": "video/mp2t"]
-
-				if let attr = try? FileManager.default.attributesOfItem(atPath: filePath),
-					 let fileSize = attr[FileAttributeKey.size] as? UInt64 {
-					responseHeader["Content-Length"] = String(fileSize)
-				}
-
-				return .raw(200, "OK", responseHeader, { writer in
-					try? writer.write(file)
-					file.close()
-				})
-			}
-			return .notFound
-		}
-
-		self["/\(path)/\(livestreamPlaylistFilename)"] = { request in
-			return .ok(
-				.data("""
-					#EXTM3U
-					#EXT-X-VERSION:3
-					#EXT-X-ALLOW-CACHE:NO
-					## Created with Z/IPStream R/2 v1.08.09
-					#EXT-X-STREAM-INF:BANDWIDTH=137557,CODECS="mp4a.40.2"
-					\(self.livestreamVariantFilename)
-					""".data(using: .utf8)!,
-					contentType: "application/vnd.apple.mpegurl"
-				)
-			)
-		}
-
-		self["/\(path)/\(livestreamVariantFilename)"] = { [weak self] request in
-			guard let self = self else { return .internalServerError }
-
-			if request.queryParams.contains(where: { (key, value) in key == "_HLS_skip" && value == "YES" }) {
-				let response = self.currentDeltaPlaylist
-				self.previousDeltaPlaylistResponse = response
-				return .ok(.data(response.data(using: .utf8)!, contentType: "application/vnd.apple.mpegurl"))
-			} else {
-				let response = self.currentPlaylist
-				self.previousPlaylistResponse = response
-				return .ok(.data(response.data(using: .utf8)!, contentType: "application/vnd.apple.mpegurl"))
-			}
-		}
-
-		self.notFoundHandler = { request in
-			print("Not found handler called \(dump(request))")
-			return .notFound
-		}
-	}
 }
+
+private let log = OSLog(subsystem: "de.fruitco.hlsmock", category: "server")
